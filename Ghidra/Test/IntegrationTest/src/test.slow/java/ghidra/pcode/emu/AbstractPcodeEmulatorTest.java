@@ -46,6 +46,7 @@ public abstract class AbstractPcodeEmulatorTest extends AbstractGTest {
 	public static final LanguageID LANGID_TOY_LE = new LanguageID("Toy:BE:64:default");
 	public static final LanguageID LANGID_X64 = new LanguageID("x86:LE:64:default");
 	public static final LanguageID LANGID_ARMV8 = new LanguageID("ARM:LE:32:v8");
+	public static final LanguageID LANGID_MIPS_BE = new LanguageID("MIPS:BE:32:default");
 
 	public static final int FIB_ITER_N = 100000;
 	public static final long FIB_ITER_VAL = 2754320626097736315L;
@@ -485,5 +486,128 @@ public abstract class AbstractPcodeEmulatorTest extends AbstractGTest {
 		Register r0 = emu.getLanguage().getRegister("r0");
 		assertEquals(1,
 			arithmetic.toLong(thread.getState().getVar(r0, Reason.INSPECT), Purpose.INSPECT));
+	}
+
+	public static final long MIPS_ENTRY = 0x00400000;
+	public static final long MIPS_NOP = MIPS_ENTRY + 4;
+	public static final long MIPS_END = MIPS_ENTRY + 12;
+
+	/**
+	 * Load a MIPS program in which the second instruction is a {@code nop}, which has no p-code
+	 * 
+	 * <pre>
+	 * 00400000: addiu t0,zero,1
+	 * 00400004: nop
+	 * 00400008: addiu t0,t0,1
+	 * 0040000c: addiu t1,zero,7
+	 * </pre>
+	 * 
+	 * @param emu the emulator
+	 * @return a new thread, with its counter at the entry
+	 */
+	protected PcodeThread<byte[]> loadMipsProgramWithNop(PcodeEmulator emu) {
+		AddressSpace space = emu.getLanguage().getDefaultSpace();
+		Address entry = space.getAddress(MIPS_ENTRY);
+		byte[] bytes = new byte[] {
+			0x24, 0x08, 0x00, 0x01, // addiu t0,zero,1
+			0x00, 0x00, 0x00, 0x00, // nop
+			0x25, 0x08, 0x00, 0x01, // addiu t0,t0,1
+			0x24, 0x09, 0x00, 0x07, // addiu t1,zero,7
+		};
+		emu.getSharedState().setVar(entry, bytes.length, false, bytes);
+		PcodeThread<byte[]> thread = emu.newThread();
+		thread.overrideCounter(entry);
+		thread.overrideContextWithDefault();
+		return thread;
+	}
+
+	protected void assertRegisterValue(PcodeEmulator emu, PcodeThread<byte[]> thread,
+			String name, long expected) {
+		Register reg = emu.getLanguage().getRegister(name);
+		assertEquals(expected, emu.getArithmetic()
+				.toLong(thread.getState().getVar(reg, Reason.INSPECT), Purpose.INSPECT));
+	}
+
+	@Test
+	public void testUnconditionalBreakpointOnInstructionWithoutPcode() throws Exception {
+		PcodeEmulator emu = createEmulator(getLanguage(LANGID_MIPS_BE));
+		AddressSpace space = emu.getLanguage().getDefaultSpace();
+		PcodeThread<byte[]> thread = loadMipsProgramWithNop(emu);
+
+		// Even the unconditional breakpoint's Sleigh calls emu_exec_decoded() after emu_swi()
+		emu.addBreakpoint(space.getAddress(MIPS_NOP), "1:1");
+
+		try {
+			thread.run();
+			fail("Should have interrupted on breakpoint");
+		}
+		catch (InterruptPcodeExecutionException e) {
+		}
+
+		assertRegisterValue(emu, thread, "t0", 1);
+		assertEquals(space.getAddress(MIPS_NOP), thread.getCounter());
+	}
+
+	@Test
+	public void testBreakpointHitOnInstructionWithoutPcode() throws Exception {
+		PcodeEmulator emu = createEmulator(getLanguage(LANGID_MIPS_BE));
+		AddressSpace space = emu.getLanguage().getDefaultSpace();
+		PcodeThread<byte[]> thread = loadMipsProgramWithNop(emu);
+
+		// The not-taken path of the breakpoint still invokes emu_exec_decoded() on the nop
+		emu.addBreakpoint(space.getAddress(MIPS_NOP), "t0 == 1");
+
+		try {
+			thread.run();
+			fail("Should have interrupted on breakpoint");
+		}
+		catch (InterruptPcodeExecutionException e) {
+		}
+
+		assertRegisterValue(emu, thread, "t0", 1);
+		assertEquals(space.getAddress(MIPS_NOP), thread.getCounter());
+	}
+
+	@Test
+	public void testBreakpointMissedOnInstructionWithoutPcode() throws Exception {
+		PcodeEmulator emu = createEmulator(getLanguage(LANGID_MIPS_BE));
+		AddressSpace space = emu.getLanguage().getDefaultSpace();
+		PcodeThread<byte[]> thread = loadMipsProgramWithNop(emu);
+
+		// The condition is never true, so emu_exec_decoded() must execute the nop, then proceed
+		emu.addBreakpoint(space.getAddress(MIPS_NOP), "t0 == 0x99");
+		emu.addBreakpoint(space.getAddress(MIPS_END), "1:1");
+
+		try {
+			thread.run();
+			fail("Should have interrupted on breakpoint");
+		}
+		catch (InterruptPcodeExecutionException e) {
+		}
+
+		assertRegisterValue(emu, thread, "t0", 2);
+		assertRegisterValue(emu, thread, "t1", 0);
+		assertEquals(space.getAddress(MIPS_END), thread.getCounter());
+	}
+
+	@Test
+	public void testInjectExecDecodedOnInstructionWithoutPcode() throws Exception {
+		PcodeEmulator emu = createEmulator(getLanguage(LANGID_MIPS_BE));
+		AddressSpace space = emu.getLanguage().getDefaultSpace();
+		PcodeThread<byte[]> thread = loadMipsProgramWithNop(emu);
+
+		emu.inject(space.getAddress(MIPS_NOP), "emu_exec_decoded();");
+		emu.addBreakpoint(space.getAddress(MIPS_END), "1:1");
+
+		try {
+			thread.run();
+			fail("Should have interrupted on breakpoint");
+		}
+		catch (InterruptPcodeExecutionException e) {
+		}
+
+		assertRegisterValue(emu, thread, "t0", 2);
+		assertRegisterValue(emu, thread, "t1", 0);
+		assertEquals(space.getAddress(MIPS_END), thread.getCounter());
 	}
 }

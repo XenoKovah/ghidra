@@ -198,6 +198,9 @@ public class DecoderUseropLibrary extends AnnotatedPcodeUseropLibrary<MaskedByte
 	 * the decoder interpret the p-code instead. We also need to ensure the decoded instruction is
 	 * added into the passage.
 	 * <p>
+	 * If the decoded instruction has no p-code (e.g., a MIPS {@code nop}), then there is nothing to
+	 * inline, and the userop is replaced by nothing, as in {@link #emu_skip_decoded}.
+	 * <p>
 	 * Note that the {@link PcodeOp#CALLOTHER callother} op will be mapped to a {@link JitNopOp nop}
 	 * during translation because we have set {@code canInline}.
 	 * 
@@ -213,7 +216,18 @@ public class DecoderUseropLibrary extends AnnotatedPcodeUseropLibrary<MaskedByte
 			PseudoInstruction instruction = de.decodeInstruction();
 			de.addInstruction(instruction);
 			PcodeProgram program = PcodeProgram.fromInstruction(instruction, false);
-			program = new PcodeProgram(program, de.rewriteOps(program.getCode()));
+			List<PcodeOp> code = de.rewriteOps(program.getCode());
+			if (code.isEmpty()) {
+				/**
+				 * An instruction can legitimately have no p-code, e.g., a MIPS nop. There is
+				 * nothing to execute, and PcodeProgram(PcodeProgram, List) does not accept empty
+				 * code. Like emu_skip_decoded, "inline" nothing. The instruction was still decoded
+				 * and added.
+				 */
+				de.recordInline(op, List.of());
+				return;
+			}
+			program = new PcodeProgram(program, code);
 			de.recordInline(op, program.getCode());
 			executor.execute(program, library);
 		}
